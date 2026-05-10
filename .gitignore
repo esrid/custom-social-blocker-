@@ -1,0 +1,10 @@
+# Binaries
+blocker
+
+# Logs and State
+blocker.log
+state.json
+*.tmp
+
+# OS files
+.DS_Store
