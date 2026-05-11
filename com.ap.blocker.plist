@@ -4,19 +4,22 @@
 <dict>
     <key>Label</key>
     <string>com.ap.blocker</string>
+
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/ap/dev/blocker/blocker</string>
+        <string>/usr/local/bin/blocker</string>
     </array>
+
+    <!-- Start immediately when agent is loaded (at login) -->
     <key>RunAtLoad</key>
     <true/>
+
+    <!-- Restart automatically if it crashes -->
     <key>KeepAlive</key>
     <true/>
-    <key>StandardOutPath</key>
-    <string>/Users/ap/dev/blocker/blocker.log</string>
-    <key>StandardErrorPath</key>
-    <string>/Users/ap/dev/blocker/blocker.log</string>
-    <key>WorkingDirectory</key>
-    <string>/Users/ap/dev/blocker</string>
+
+    <!-- Minimum seconds between restarts to avoid spin-loop on crash -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
 </dict>
 </plist>
