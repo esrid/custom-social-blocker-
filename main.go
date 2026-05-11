@@ -20,11 +20,10 @@ import (
 
 const (
 	proxyPort   = 8877
-	pacPort     = 8878
-	dailyLimit  = 120 // minutes per day
-	hourlyLimit = 25  // minutes per clock-hour
-	nightStart  = 20  // block at 20:00
-	nightEnd    = 8   // unblock at 08:00
+	dailyLimit  = 120
+	hourlyLimit = 25
+	nightStart  = 20
+	nightEnd    = 8
 )
 
 var (
@@ -84,10 +83,11 @@ var socialDomains = []string{
 }
 
 type State struct {
-	Date            string      `json:"date"`
-	TotalMinutes    int         `json:"total_minutes"`
-	HourlyMinutes   map[int]int `json:"hourly_minutes"`
-	NightBlockUntil time.Time   `json:"night_block_until"`
+	Date            string    `json:"date"`
+	TotalMinutes    int       `json:"total_minutes"`
+	WindowStart     time.Time `json:"window_start"`      // start of current 60-min rolling window
+	WindowMinutes   int       `json:"window_minutes"`    // minutes used in that window
+	NightBlockUntil time.Time `json:"night_block_until"`
 }
 
 type Blocker struct {
@@ -107,7 +107,7 @@ func (b *Blocker) loadState() {
 	defer b.mu.Unlock()
 
 	today := time.Now().Format("2006-01-02")
-	fresh := State{Date: today, HourlyMinutes: make(map[int]int)}
+	fresh := State{Date: today}
 
 	data, err := os.ReadFile(stateFile)
 	if err != nil {
@@ -119,13 +119,9 @@ func (b *Blocker) loadState() {
 		b.state = fresh
 		return
 	}
-	if s.HourlyMinutes == nil {
-		s.HourlyMinutes = make(map[int]int)
-	}
 	if s.Date != today {
 		b.state = State{
 			Date:            today,
-			HourlyMinutes:   make(map[int]int),
 			NightBlockUntil: s.NightBlockUntil,
 		}
 	} else {
@@ -148,7 +144,9 @@ func (b *Blocker) isBlockedLocked() bool {
 	if b.state.TotalMinutes >= dailyLimit {
 		return true
 	}
-	if b.state.HourlyMinutes[now.Hour()] >= hourlyLimit {
+	// Rolling 60-min window: if 25 min used and window not yet expired → blocked
+	if b.state.WindowMinutes >= hourlyLimit &&
+		now.Before(b.state.WindowStart.Add(time.Hour)) {
 		return true
 	}
 	return false
@@ -226,7 +224,7 @@ func (b *Blocker) handleConnect(w http.ResponseWriter, r *http.Request) {
 		dst.Close()
 		return
 	}
-	src, _, err := hj.Hijack()
+	src, buf, err := hj.Hijack()
 	if err != nil {
 		dst.Close()
 		return
@@ -234,11 +232,13 @@ func (b *Blocker) handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	src.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 
+	log.Printf("TUNNEL %s", r.Host)
+
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		io.Copy(dst, src)
+		io.Copy(dst, buf) // drain bufio buffer first, then stream
 		dst.Close()
 	}()
 	go func() {
@@ -278,38 +278,20 @@ func (b *Blocker) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	io.Copy(w, resp.Body)
 }
 
-func (b *Blocker) servePAC(w http.ResponseWriter, r *http.Request) {
-	var entries []string
-	for _, d := range socialDomains {
-		entries = append(entries, `"`+d+`"`)
-	}
-	pac := fmt.Sprintf(`function FindProxyForURL(url, host) {
-    var blocked = [%s];
-    var h = host.toLowerCase();
-    if (h.substring(0,4) === "www.") h = h.substring(4);
-    for (var i = 0; i < blocked.length; i++) {
-        if (h === blocked[i] || h.substr(-(blocked[i].length+1)) === "."+blocked[i])
-            return "PROXY 127.0.0.1:%d";
-    }
-    return "DIRECT";
-}
-`, strings.Join(entries, ","), proxyPort)
-	w.Header().Set("Content-Type", "application/x-ns-proxy-autoconfig")
-	w.Write([]byte(pac))
-}
 
-// nsCmd builds a networksetup command, prefixed with sudo when running as non-root.
-func nsCmd(args ...string) *exec.Cmd {
-	if os.Getuid() == 0 {
-		return exec.Command("/usr/sbin/networksetup", args...)
+// networkSetup runs networksetup with sudo -n (non-interactive, requires NOPASSWD sudoers rule).
+func networkSetup(args ...string) error {
+	cmd := exec.Command("sudo", append([]string{"-n", "/usr/sbin/networksetup"}, args...)...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		log.Printf("networksetup %v: %v — %s", args, err, out)
 	}
-	return exec.Command("sudo", append([]string{"/usr/sbin/networksetup"}, args...)...)
+	return err
 }
 
 func getNetworkServices() []string {
-	out, err := nsCmd("-listallnetworkservices").Output()
+	out, err := exec.Command("sudo", "-n", "/usr/sbin/networksetup", "-listallnetworkservices").Output()
 	if err != nil {
-		log.Printf("listallnetworkservices: %v", err)
 		return nil
 	}
 	var svcs []string
@@ -327,17 +309,23 @@ func getNetworkServices() []string {
 }
 
 func enableProxy() {
-	pacURL := fmt.Sprintf("http://127.0.0.1:%d/proxy.pac", pacPort)
+	host := "127.0.0.1"
+	port := fmt.Sprintf("%d", proxyPort)
 	for _, svc := range getNetworkServices() {
-		nsCmd("-setautoproxyurl", svc, pacURL).Run()
-		nsCmd("-setautoproxystate", svc, "on").Run()
+		networkSetup("-setwebproxy", svc, host, port)
+		networkSetup("-setwebproxystate", svc, "on")
+		networkSetup("-setsecurewebproxy", svc, host, port)
+		networkSetup("-setsecurewebproxystate", svc, "on")
+		networkSetup("-setautoproxystate", svc, "off") // disable any old PAC
 		log.Printf("proxy enabled: %s", svc)
 	}
 }
 
 func disableProxy() {
 	for _, svc := range getNetworkServices() {
-		nsCmd("-setautoproxystate", svc, "off").Run()
+		networkSetup("-setwebproxystate", svc, "off")
+		networkSetup("-setsecurewebproxystate", svc, "off")
+		networkSetup("-setautoproxystate", svc, "off")
 		log.Printf("proxy disabled: %s", svc)
 	}
 }
@@ -373,19 +361,25 @@ func (b *Blocker) usageTracker() {
 			saved := b.state.NightBlockUntil
 			b.state = State{
 				Date:            today,
-				HourlyMinutes:   make(map[int]int),
 				NightBlockUntil: saved,
 			}
 			log.Printf("daily reset: %s", today)
 		}
 
+		// Roll window if 60 min have passed since it started
+		if now.Sub(b.state.WindowStart) >= time.Hour {
+			b.state.WindowStart = now
+			b.state.WindowMinutes = 0
+		}
+
 		if atomic.LoadInt64(&b.activeCount) > 0 && !b.isBlockedLocked() {
-			h := now.Hour()
 			b.state.TotalMinutes++
-			b.state.HourlyMinutes[h]++
-			log.Printf("usage: %d/%d daily, h%d: %d/%d",
+			b.state.WindowMinutes++
+			windowExpires := b.state.WindowStart.Add(time.Hour)
+			log.Printf("usage: %d/%d daily, window: %d/%d (resets %s)",
 				b.state.TotalMinutes, dailyLimit,
-				h, b.state.HourlyMinutes[h], hourlyLimit)
+				b.state.WindowMinutes, hourlyLimit,
+				windowExpires.Format("15:04"))
 			b.saveState()
 		}
 
@@ -420,6 +414,10 @@ func main() {
 	now := time.Now()
 	h := now.Hour()
 	b.mu.Lock()
+	// Init rolling window if never set
+	if b.state.WindowStart.IsZero() {
+		b.state.WindowStart = now
+	}
 	if h >= nightStart || h < nightEnd {
 		if b.state.NightBlockUntil.IsZero() || now.After(b.state.NightBlockUntil) {
 			var until time.Time
@@ -434,14 +432,6 @@ func main() {
 		}
 	}
 	b.mu.Unlock()
-
-	pacMux := http.NewServeMux()
-	pacMux.HandleFunc("/proxy.pac", b.servePAC)
-	go func() {
-		if err := http.ListenAndServe(fmt.Sprintf("127.0.0.1:%d", pacPort), pacMux); err != nil {
-			log.Fatalf("PAC server: %v", err)
-		}
-	}()
 
 	go func() {
 		srv := &http.Server{
@@ -463,6 +453,16 @@ func main() {
 	go proxyMaintainer()
 
 	log.Println("blocker running")
+
+	// SIGUSR1 → reload state from disk (used by make test / make block-test)
+	usr1 := make(chan os.Signal, 1)
+	signal.Notify(usr1, syscall.SIGUSR1)
+	go func() {
+		for range usr1 {
+			b.loadState()
+			log.Println("state reloaded from disk")
+		}
+	}()
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
